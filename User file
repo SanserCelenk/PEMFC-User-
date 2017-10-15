@@ -1,0 +1,980 @@
+/*
+ * Copyright ANSYS. All Rights Reserved.
+ */
+
+#include "udf.h"
+#include "pem.h"
+
+/*=====================================================================*/
+/*
+ * User modifiable functions.
+ *
+ * You MUST NOT change the names and argument lists of these functions!
+ *
+ *======================================================================
+ */
+
+real Get_P_sat(real T, cell_t c, Thread *t)
+{
+  const real exponent_limit = 25.; /* limit meaningful values of exponent */
+
+  real P_sat;
+  real dT = T - 273.17;
+  real exponent
+    = -2.1794 + 0.02953*dT - 9.1837e-5*dT*dT + 1.4454e-7*dT*dT*dT;
+  real p0 = 101325.0;
+
+  exponent = MIN(MAX(-exponent_limit,exponent),exponent_limit);
+
+  P_sat = pow(10.,exponent) * p0;
+
+  return P_sat;
+}
+
+real Water_Activity (real P, real T, cell_t c, Thread *t)
+{
+  real act, P_sat;
+  real C_h2o=0.0;
+  real MMW;
+ 
+  int i=0;
+  real sat = MAX(TINY, MIN(C_UDSI(c,t,w_sat),1.0));
+
+  P_sat = Get_P_sat(T, c, t);
+
+  MMW = 0.0;
+  for (i=0; i<n_spe; i++)
+    {
+      MMW += C_YI(c,t,i)/mw[i];
+    }
+  MMW = 1.0/MMW;
+
+  C_h2o = C_YI(c,t,i_h2o)*C_R(c,t)/mw[i_h2o];
+
+  if (pem_mp_on) 
+    act = R_Gas*T/P_sat*C_h2o + 2.0*sat;   
+  else 
+    act = R_Gas*T/P_sat*C_h2o;     /* = P_wv/P_sat*/
+
+  return act;
+}
+
+real Water_Content (real act)
+{
+  real lam = 0.043;
+
+  if (act < 0.0) act = 0.0;
+  if (act > 3.0) act = 3.0;
+
+  if (act <= 1.0)
+    {
+      lam = 0.043 + 17.18*act - 39.85*act*act + 36.0*act*act*act;
+    }
+  if (act > 1.0)
+    {
+      lam = 14.0 + 1.4*(act - 1.0);
+    }
+  return lam;
+}
+
+real Osmotic_Drag_Coefficient(real P, real T, cell_t c, Thread *t)
+{
+  real act, lam, drag = 0.0;
+
+  act = Water_Activity(P,T,c,t);
+
+  if (act < 0.0) act = 0.0;
+  if (act > 3.0) act = 3.0;
+
+  lam = Water_Content(act);
+
+  drag = 2.5*lam/22.0;   /* 0.113636364*lam Springer et al */
+  if(net_water_transport)
+    drag = net_water_tran_coeff*lam;
+ 
+  return drag;
+}
+
+real Membrane_Conductivity(real lam, cell_t c, Thread *t)
+{
+  real T = C_T(c,t);
+  real sigma = 1.0;
+  int zt = get_fc_zone_type(t->id);
+  real eps_corr = 1.0;
+  real Eact=1268.0;
+  real eps_e, tau_e, beta_e, alpha_e;
+
+  lam = MAX(min_water_content,lam); /* default value of min_water_content=1.0, 
+                                       users can reset it using rpsetvar command:
+                                      e.g. (rpsetvar 'rp/min_water_content 0.1)  
+                                    */
+  if(effective_pcond) 
+   {
+     if (zt==aca_zone)     /*anode catalyst*/
+       {
+         eps_e = aca_ionomer_vof;
+         tau_e = aca_tortu; 
+         beta_e = aca_beta;
+         alpha_e = aca_alpha;
+         Eact  = aca_act;
+         eps_corr = aca_ionomer_vof/aca_tortu;
+       }
+     else if (zt==cca_zone)                /*cathode catalyst*/
+       {
+         eps_e = cca_ionomer_vof;
+         tau_e = cca_tortu; 
+         beta_e = cca_beta;
+         alpha_e = cca_alpha;
+         Eact  = cca_act;
+         eps_corr = cca_ionomer_vof/cca_tortu;
+       }
+     else    /* membrane */
+       {
+         Eact = mem_act; 
+         beta_e = beta_m;
+         alpha_e = alpha_m;
+       }
+   }
+  else     /*old method*/
+   {
+     beta_e = beta_m;
+     alpha_e = alpha_m;
+   }
+
+   if (lam>=0.999)   /*Springer (1991)*/ 
+    {
+     sigma = eps_corr*alpha_e*pow((0.514*lam-0.326),beta_e); 
+     sigma *= exp(Eact*(T-303.0)/(T*303.0)); 
+    }
+   else     
+     sigma = eps_corr*(0.33*lam + 0.01); 
+
+  return  sigma;
+}
+
+real Electrolyte_Conductivity(cell_t c, Thread *t)
+{             /*this function is used for sofc and/or electrolysis only*/
+  real T = C_T(c,t);  
+  real cond;
+
+  if (T < 1073.0) T=1073.0;
+  if (T > 1373.0) T=1373.0;
+  cond = 100.0/(0.3685+0.002838*exp(10300.0/T));
+
+  return cond;
+}
+
+
+real Water_Content_Diffusivity(real lam, 
+                               real T, 
+                               real mem_mol_density,
+                               cell_t c, Thread *t)
+{
+  real diff_w;
+
+  if (1)   /* reference 1 --cited by CY Wang */
+    {
+      if (lam<3.0)
+        diff_w = 3.1e-7*lam*(exp(0.28*lam)-1.0)*exp(-2346.0/T);
+      else
+        diff_w = 4.17e-8*lam*(1+161*exp(-lam))*exp(-2346.0/T);
+    }
+  else     /*  use Dutta (USC) fomulation as another option */
+    {
+      real e_t = exp(2416*(T-303)/(303*T));
+      real D_lam = 1.0e-10;
+
+      {
+        if(lam<2)
+          D_lam *= 1.0;
+        else if (lam < 3)
+          D_lam *= (1+2*(lam-2));
+        else if (lam < 4.5)
+          D_lam *= (3-1.167*(lam-3));
+        else
+          D_lam *= 1.25;
+      }
+      diff_w = D_lam*e_t;
+    }
+
+  diff_w *= mem_mol_density;
+  diff_w *= b_diff_lam;
+
+  return diff_w;
+}
+
+real Gas_Diffusivity(cell_t c, Thread *t, int j_spe)
+{
+  real p = op_pres + C_P(c,t);
+  real p0 = 101325.0;
+  real T = C_T(c,t);
+  real T0 = 300.0;
+  real porosity = C_POR(c,t);
+  real diff = Diff_others;
+  real s = (is_pemfc()) ? MIN(MAX(C_UDSI(c,t,w_sat),0), 0.99) : 0.0;
+
+  if (j_spe==i_h2)       diff = Diff_h2;
+  else if (j_spe==i_o2)  diff = Diff_o2;
+  else if (j_spe==i_h2o) diff = Diff_h2o;
+
+  diff *= p0/p*pow((T/T0),1.5)*pow(porosity,0.5);    /* correct by T,P & por */
+           /* inside fluent source, D_eff=porosity*D; therefore,
+              to implement por**1.5 only por**0.5 is needed here */
+
+  if (is_pemfc() && pem_mp_on)
+    diff *=  pow((1-s),b_sat);
+
+  return diff;
+}
+
+real MCD_Gas_Diffusivity(cell_t c, Thread *t, int i)
+{
+   /* applying tortuosity correction to the gas-species diffusion coefficients 
+      computed with the multi-component diffusion option */
+
+Material *m = THREAD_MATERIAL(t);
+real diff;
+static real brug;
+static real sig_ab[MAX_SPE_EQNS*(MAX_SPE_EQNS-1)];
+static real eps_ab[MAX_SPE_EQNS*(MAX_SPE_EQNS-1)];
+real T,T32,P;
+real t_star, omega_d;
+real por,tor;
+real s = (is_pemfc()) ? MIN(MAX(C_UDSI(c,t,w_sat),0), 0.99) : 0.0;
+
+cxboolean tortuosity_correction = FALSE;
+
+  por = C_POR(c,t);
+  brug = 1.0;
+
+if (tortuosity_correction)
+                  /* torturosity correction, can be used as an option */  
+  {
+   tor = 3.0;         
+   if(por<0.999)
+     brug = 1.0/tor; 
+   else
+     brug = 1.0;
+  }
+else 
+  brug = pow(por,0.5);     /* inside fluent source, D_eff=porosity*D; therefore,
+                           to implement por**1.5 only por**0.5 is needed here */
+if (i==0)
+        {
+          mass_diffusivity_kinetic_theory_parameters(m, sig_ab, eps_ab);
+        }
+
+T = C_T(c,t);
+T32 = T*sqrt(T);
+P = C_P(c,t)+op_pres;
+
+t_star  = T/eps_ab[i];
+omega_d = 1./pow(t_star,0.145)+1./((t_star + 0.5)*(t_star + 0.5));
+
+diff = 0.0188*T32*sig_ab[i]/(P*omega_d);
+
+if (is_pemfc() && pem_mp_on)
+  diff *=  pow((1-s),b_sat);
+
+return brug*diff;
+}
+
+real Saturation_Diffusivity(real sat,
+                            real cos_theta,
+                            real porosity,
+                            cell_t c, Thread *t)
+{
+  const real K_abs    = 2.55e-13;     /* m^2 --- Kaviany  */
+  const real surf_ten = 0.0644;       /* N/m2 */
+  const real mu_liq   = 4.05e-4;      /* kg/m-s   */
+
+  real krl = pow(sat+TINY, s_sat);
+
+  real dpcds = 0.0;
+  real ss = 0.0;
+
+  if (cos_theta>0.0)  /* hydrophilic media */
+    ss = 1-sat;
+  else                /* hydrophobic media */
+    ss = sat;
+  
+  dpcds =  surf_ten*ABS(cos_theta)/sqrt(K_abs/porosity)
+               *(1.417 + 3*1.263*ss*ss - 2*2.12*ss);
+     
+
+  return krl*rho_liq*K_abs/mu_liq*dpcds;
+}
+
+
+real Anode_AV_Ratio(cell_t c, Thread *t)
+{
+  /* surface-to-volume ratio in anode catalyst
+   *
+   * The default for constant value is aca_av_ratio , which updated
+   * from the user interface.  To include spatial dependency, you may
+   * use, say
+   *
+   * real NV_VEC(x);
+   * C_CENTROID(x,c,t)
+   *
+   * to get the spatial coordinates in the vector x.
+   */
+
+  return aca_av_ratio;
+}
+
+real Cathode_AV_Ratio(cell_t c, Thread *t)
+{
+  /* surface-to-volume ratio in cathode catalyst
+   *
+   * The default for constant value is cca_av_ratio , which updated
+   * from the user interface.  To include spatial dependency, you may
+   * use, say
+   *
+   * real NV_VEC(x);
+   * C_CENTROID(x,c,t)
+   *
+   * to get the spatial coordinates in the vector x.
+   */
+
+  return cca_av_ratio;
+}
+
+real Anode_J_TransCoef(cell_t c, Thread *t)
+{
+  /* effective anode transfer current coefficient
+   *
+   * The following global variables hold the input from the panel:
+   *
+   * j_ref_a  anode reference current density
+   * c_ref_a  anode reference concentration
+   * g_a      anode concentration exponent
+   *
+   * The global variable j_trans_coef_a is preset as
+   *
+   *    j_trans_coef_a = j_ref_a/pow(c_ref_a, g_a)
+   *
+   * One may provide values based on local information in the cell.
+   */
+  return j_trans_coef_a*Anode_AV_Ratio(c, t);
+}
+
+real Cathode_J_TransCoef(cell_t c, Thread *t)
+{
+  /* effective cathode transfer current coefficient
+   *
+   * The following global variables hold the input from the panel:
+   *
+   * j_ref_c  cathode reference current density
+   * c_ref_c  cathode reference concentration
+   * g_c      cathode concentration exponent
+   *
+   * The global variable j_trans_coef_c is preset as
+   *
+   *    j_trans_coef_c = j_ref_c/pow(c_ref_c, g_c)
+   *
+   * One may provide values based on local information in the cell.
+   */
+  return j_trans_coef_c*Cathode_AV_Ratio(c, t);
+}
+
+real Open_Cell_Voltage(cell_t c, Thread *t)
+{
+  real U0 = 0.0;
+  int zt = get_fc_zone_type(t->id);
+  real T = C_T(c,t);
+
+  if(use_half_cell_u0 && is_pemfc())
+    {
+      if(zt==cca_zone)   /* cathode side */
+        {
+          U0 = E_ca_std - 0.5*Delta_S_ca/Farad*(T-T_std_nernst) 
+                        - 0.5*R_Gas/Farad*T*log(C_YI(c,t,i_h2o)/(mw[i_h2o])*R_Gas*T*C_R(c,t)
+                                                /sqrt((C_YI(c,t,i_o2)+TINY)/(mw[i_o2])*R_Gas*T*C_R(c,t)*p_std_nernst));
+
+        }
+      else if (zt==aca_zone)  /* anode side */
+        {
+          U0 = E_an_std - 0.5*Delta_S_an/Farad*(T-T_std_nernst)
+                        - 0.5*R_Gas/Farad*T*log(C_YI(c,t,i_h2)/(mw[i_h2])*R_Gas*T*C_R(c,t)/p_std_nernst);
+        }
+    }
+  else
+    {
+    U0 = V_open;
+	
+    }
+
+  return U0;
+}
+
+
+
+real Leakage_Current (cell_t c, Thread *t)
+{
+   real leak_i = leakage_current; /* unit:  A/m3 */
+
+   /* The default constant value is "leakage_current",
+    * which is taken from the user interface.
+    * The default value may be overwritten here.
+    */
+
+   return leak_i;
+}
+
+real resistance_in_channel(real sat)
+{
+  real f_sat = sat*sat/((1-sat)*(1-sat)*(1-sat)+TINY); 
+  real resist_coeff = 2.0e9;
+
+  f_sat *= resist_coeff;
+  
+  return f_sat;
+}
+
+
+
+
+DEFINE_PROFILE(resist_chan, t, nv)
+{
+  pem_resist_chan(t,nv);
+  return;
+}
+
+void Set_UDS_Names(char uds[n_uds_required][STRING_SIZE])
+{
+    strncpy(uds[0], "Electric Potential", STRING_SIZE-1);
+    strncpy(uds[1], "Protonic Potential", STRING_SIZE-1);
+    strncpy(uds[2], "Water Saturation",   STRING_SIZE-1);
+    strncpy(uds[3], "Water Content",      STRING_SIZE-1);
+}
+
+void Set_UDM_Names(char udm[n_udm_required][STRING_SIZE])
+{
+      strncpy(udm[ 0], "X XXXXXXXXXXXXXXXXXXXX",         STRING_SIZE-1);
+      strncpy(udm[ 1], "Y Current Flux Density",         STRING_SIZE-1);
+      strncpy(udm[ 2], "Z Current Flux Density",         STRING_SIZE-1);
+      strncpy(udm[ 3], "Current Flux Density Magnitude", STRING_SIZE-1);
+      strncpy(udm[ 4], "Ohmic Heat Source",              STRING_SIZE-1);
+      strncpy(udm[ 5], "Reaction Heat Source",           STRING_SIZE-1);
+      strncpy(udm[ 6], "Overpotential",                  STRING_SIZE-1);
+      strncpy(udm[ 7], "Phase Change Source (PEM)",            STRING_SIZE-1);
+      strncpy(udm[ 8], "Osmotic Drag Coefficient (PEM)",       STRING_SIZE-1);
+      strncpy(udm[ 9], "Liquid Water Activity (PEM)",          STRING_SIZE-1);
+      strncpy(udm[10], "Membrane Water Content (PEM)",         STRING_SIZE-1);
+      strncpy(udm[11], "Protonic Conductivity",          STRING_SIZE-1);
+      strncpy(udm[12], "Back Diffusion Source(PEM)",     STRING_SIZE-1);
+      strncpy(udm[13], "Transfer Current",               STRING_SIZE-1);
+      strncpy(udm[14], "Osmotic Drag Source (PEM)",            STRING_SIZE-1);
+}
+
+/*=====================================================================*/
+/*
+ * Interface to FLUENT. Do not modify.
+ *
+ */
+
+DEFINE_PROPERTY(density,c,t)
+{
+  return pem_density_with_coolant(c,t);
+}
+
+DEFINE_DIFFUSIVITY(diff,c,t,j_spe)
+{
+  return pem_diff(c,t,j_spe);
+}
+
+DEFINE_DIFFUSIVITY(cond,c,t,iuds)
+{
+  return pem_cond(c,t,iuds);
+}
+
+DEFINE_UDS_FLUX(uds_flux,f,t,iuds)
+{
+  return pem_uds_flux(f,t,iuds);
+}
+
+DEFINE_SOURCE(source_s,c,t,dS,eqn)
+{
+  return pem_source_phi_s(c,t,dS,eqn);
+}
+
+DEFINE_SOURCE(source_m,c,t,dS,eqn)
+{
+  return pem_source_phi_m(c,t,dS,eqn);
+}
+
+DEFINE_SOURCE(source_h2,c,t,dS,eqn)
+{
+  return pem_source_h2(c,t,dS,eqn);
+}
+
+DEFINE_SOURCE(source_o2,c,t,dS,eqn)
+{
+  return pem_source_o2(c,t,dS,eqn);
+}
+
+DEFINE_SOURCE(source_h2o,c,t,dS,eqn)
+{
+  return pem_source_h2o(c,t,dS,eqn);
+}
+
+DEFINE_SOURCE(source_mass,c,t,dS,eqn)
+{
+  return pem_source_mass(c,t,dS,eqn);
+}
+
+DEFINE_SOURCE(source_lambda,c,t,dS,eqn)
+{
+  return pem_source_lambda(c,t,dS,eqn);
+}
+
+DEFINE_SOURCE(source_energy,c,t,dS,eqn)
+{
+  return pem_source_energy(c,t,dS,eqn);
+}
+
+DEFINE_SOURCE(source_liquid,c,t,dS,eqn)
+{
+  return pem_source_liquid(c,t,dS,eqn);
+}
+
+DEFINE_PROFILE(lam_bc, t, nv)
+{
+  pem_lam_bc(t,nv);
+  return;
+}
+
+DEFINE_INIT(initialize,domain)
+{
+  pem_initialize(domain);
+  return;
+}
+
+DEFINE_ADJUST(adjust,domain)
+{
+  pem_adjust(domain);
+  return;
+}
+
+DEFINE_UDS_UNSTEADY(unsteady, c, t, i, apu, su)
+{
+  pem_unsteady(c,t,i,apu,su);
+  return;
+}
+
+DEFINE_RW_FILE(write_sec, fp)
+{
+  pem_write_sec(fp);
+  return;
+}
+
+DEFINE_RW_FILE(read_sec, fp)
+{
+  pem_read_sec(fp);
+  return;
+}
+
+DEFINE_RW_HDF_FILE(write_sec_hdf, fname)
+{
+  pem_write_sec(NULL);
+  return;
+}
+
+DEFINE_RW_HDF_FILE(read_sec_hdf, fname)
+{
+  pem_read_sec(NULL);
+  return;
+}
+
+DEFINE_EXECUTE_ON_LOADING(pem_lib_load,libname)
+{
+
+   pem_execute_on_loading(libname);
+   rename_udm_uds();
+
+   return;
+}
+
+DEFINE_EXECUTE_AT_END(exec_at_end)
+{
+  Domain *domain = Get_Domain(ROOT_DOMAIN_ID);
+ 
+  /*   this function (DEFINE_EXECUTE_AT_END) 
+       is not called unless case file is saved first then read in. 
+       As a fix to DE89925, the update_joule_heat is moved to pem_adjust */
+
+  /* update_joule_heat(domain);  */
+
+  return;
+}
+
+DEFINE_ON_DEMAND(set_new_stack_voltage)
+{
+  pem_set_new_stack_voltage();
+  return;
+}
+
+DEFINE_ON_DEMAND(set_new_stack_current)
+{
+  pem_set_new_stack_current();
+  return;
+}
+
+DEFINE_ON_DEMAND(get_old_stack_voltage)
+{
+  pem_get_old_stack_voltage();
+  return;
+}
+
+DEFINE_ON_DEMAND(get_old_stack_current)
+{
+  pem_get_old_stack_current();
+  return;
+}
+
+/*=====================================================================*/
+
+
+
+DEFINE_ON_DEMAND(list_pemfc_udf)
+{
+   int n;
+
+   char uds_names[n_uds_required][STRING_SIZE];
+   char udm_names[n_udm_required][STRING_SIZE];
+   char uds_units[n_uds_required][STRING_SIZE];
+   char udm_units[n_udm_required][STRING_SIZE];
+    
+   Set_UDS_Names(uds_names);
+   Set_UDM_Names(udm_names);
+   Set_UDS_Units(uds_units);
+   Set_UDM_Units(udm_units);
+
+   Message0("\n\nPEMFC UDMs are defined as follows:\n");
+   for(n=0; n<n_udm_required; n++)
+      Message0("UDM %2d: %32s [%s]\n", n, udm_names[n], udm_units[n]);
+   Message0("\n\nPEMFC UDSs are defined as follows:\n");
+   for(n=0; n<n_uds_required; n++)
+      Message0("UDS %2d: %32s [%s]\n", n, uds_names[n], uds_units[n]);
+   Message("\n");
+}
+
+void rename_udm_uds(void)
+{
+   /* Names of UDSs and UDMs may be modified in the above two functions.
+      The Units must be defined in the definition of the scheme
+      panel and are NOT adjustable */
+
+   char uds_names[n_uds_required][STRING_SIZE];
+   char udm_names[n_udm_required][STRING_SIZE];
+
+   Set_UDS_Names(uds_names);
+   Set_UDM_Names(udm_names);
+
+   pem_set_udm_uds_names(udm_names, uds_names); 
+}
+
+DEFINE_ON_DEMAND(report_current)
+{
+  pem_report();
+  return;
+}
+
+DEFINE_ANISOTROPIC_DIFFUSIVITY(aniso_econd,c,t,i,dmatrix)
+{
+  anisotropic_elec_cond(c,t,i,dmatrix);
+
+  if(pem_initialized && User_Defined_Non_Iso_Econd)  
+  {
+   int zt = get_fc_zone_type(t->id);
+
+   if(zt==adl_zone || zt==cdl_zone)
+    {  
+      /*--- In this section, users can redefine the "dmatrix" that was computed above for GDLs only ---*/
+    }
+  }
+   
+  return;
+}
+
+/*===============================================================================*/
+
+real Transfer_Current(real i_ref, real gamma, int species_i, real alpha_a,
+                      real alpha_c, real *dRade, real *dRcde, Thread *t, cell_t c)
+/*===============================================================================
+
+  Purpose: compute transfer current,  A/m3, (Ra and Rc in the fuel cell manual)
+
+   Input:  i_ref      - effective transfer current coefficient, computed by
+                        Cathode_J_TransCoef(c,t) or Anode_J_TransCoef(c,t)
+           gamma      - cathode or anode concentration exponent
+           species_i  - species index used in fuelcells (e.g. i_o2, i_h2, i_h2o)
+           alpha_a    - product of anode   exchange coefficient and F/(RT)
+           alpha_c    - product of cathode exchange coefficient and F/(RT)
+           *t         - current thread 
+           c          - current cell  
+           
+  Output:  source     - anode or cathode volumetric transfer current (Ra or Rc)
+           *dRade     - partial derivative of Ra with respect to activation loss
+           *dRcde     - partial derivative of Rc with respect to activation loss           
+
+-------------------------------------------------------------------------------*/
+{
+  real source=0.0;
+  real c_c = C_YI(c,t,species_i)*C_R(c,t)/mw[species_i];
+  real c_w = MAX(c_c,TINY);
+  real eta = C_UDSI(c,t,phi_s)-C_UDSI(c,t,phi_m);
+  real A_p=0.0;
+  real sat = 0.0;
+  real s_corr = 1.0;
+  int zt = get_fc_zone_type(t->id);
+  int n_electrons=2;
+
+  real alpha_eta_a, alpha_eta_c, exp_a, exp_c;
+  const real exponent_limit = 25.;
+  const real exp_big = exp(exponent_limit);
+  const real exp_sml = 0.;
+  const real eta_cut = 1.0e-10;
+  real local_V_open = Open_Cell_Voltage(c,t);
+  real T = C_T(c,t);
+  real por = C_POR(c,t);
+
+  if (species_i == i_o2)     /* i_h2, i_o2 i_h2o */
+    n_electrons = 4;
+
+  *dRade = 0.0;
+  *dRcde = 0.0;
+
+  if (is_pemfc()) {
+    if (pem_mp_on)
+      sat = MIN(1.0,MAX(C_UDSI(c,t,w_sat),0.0))+TINY;
+    else
+      sat = 0.0;
+    s_corr = pow(1-sat,r_sat);
+  }
+
+  if (!FC_Enabled || !echem_on) return source;
+
+  if (zt == cca_zone)
+    {
+      eta -= local_V_open;
+      if (FC_Model==PEMFC || FC_Model==SOFC) 
+           eta = MAX(-local_V_open,MIN(-eta_cut,eta));
+
+      /* prevent over- and underflow of exp() */
+      alpha_eta_c = alpha_c*eta;
+      if (exponent_limit < alpha_eta_c)
+        exp_c = exp_big;
+      else if (-exponent_limit > alpha_eta_c)
+        exp_c = exp_sml;
+      else
+        exp_c = exp(alpha_eta_c);
+
+      if(temperature_effect_on_jref && is_pemfc()) 
+        i_ref *= exp(-ca_DeltaE/(R_Gas*T)*(1-T/ca_kinetics_Tref)) ;
+
+      if (Butler_Volmer)
+        {
+          /* prevent over- and underflow of exp() */
+          alpha_eta_a = alpha_a*eta;
+          if (exponent_limit < alpha_eta_a)
+            exp_a = exp_big;
+          else if (-exponent_limit > alpha_eta_a)
+            exp_a = exp_sml;
+          else
+            exp_a = exp(alpha_eta_a);
+ 
+          if(ca_particle_model && is_pemfc())
+            {
+              real i_0s = j_trans_coef_c*pow(c_w,gamma);
+              real j_O2_Pt_ideal, j_O2_Pt, R_liq;
+               
+              if(temperature_effect_on_jref)              
+                 i_0s *=  exp(-ca_DeltaE/(R_Gas*T)*(1-T/ca_kinetics_Tref));
+
+              j_O2_Pt_ideal = i_0s/(n_electrons*Farad)*(exp_c-exp_a);
+              R_liq = (pow(1.+sat*por/(1.-por),1./3.)-1.)/( 3.*(1.-por))*Cathode_AV_Ratio(c,t)*r_part*r_part/KwDw ; 
+              j_O2_Pt = c_w/(c_w/j_O2_Pt_ideal + R_ion + R_liq);
+              source = n_electrons*Farad*Cathode_AV_Ratio(c, t)*j_O2_Pt; 
+              source *= s_corr; 
+            }
+           else 
+              A_p = i_ref*(exp_c-exp_a)/(Farad*n_electrons); 
+        }
+      else
+        A_p = i_ref*exp_c/(Farad*n_electrons);
+    }
+  else if(zt == aca_zone)
+    {
+      if(use_half_cell_u0 && is_pemfc()) 
+        eta -= local_V_open;
+
+      /* prevent over- and underflow of exp() */
+      alpha_eta_a = alpha_a*eta;
+      if (exponent_limit < alpha_eta_a)
+        exp_a = exp_big;
+      else if (-exponent_limit > alpha_eta_a)
+        exp_a = exp_sml;
+      else
+        exp_a = exp(alpha_eta_a);
+
+      if(temperature_effect_on_jref && is_pemfc()) 
+        i_ref *= exp(-an_DeltaE/(R_Gas*T)*(1-T/an_kinetics_Tref));
+
+      if (Butler_Volmer)
+        {
+          if (FC_Model==PEMFC || FC_Model==SOFC) 
+             eta = MIN(MAX(eta_cut,eta),1.2);
+
+          /* prevent over- and underflow of exp() */
+          alpha_eta_c = alpha_c*eta;
+          if (exponent_limit < alpha_eta_c)
+            exp_c = exp_big;
+          else if (-exponent_limit > alpha_eta_c)
+            exp_c = exp_sml;
+          else
+            exp_c = exp(alpha_eta_c);
+
+          A_p = i_ref*(exp_a-exp_c)/(Farad*n_electrons);      /* Butler-Volmer */
+        }
+      else
+        A_p = i_ref*exp_a/(Farad*n_electrons);
+
+    }
+
+  C_UDMI(c,t,surf_eta) = eta;
+
+  if (FC_Model==PEMFC || FC_Model==SOFC) 
+    A_p = MAX(TINY,A_p);
+
+  if(!(ca_particle_model && is_pemfc()) || zt == aca_zone)
+     source=A_p*n_electrons*Farad*pow(c_w,gamma)*s_corr;
+
+  {
+   real a_eta = alpha_a*eta;
+   real c_eta = alpha_c*eta;
+
+   if (a_eta > exponent_limit)
+     a_eta = exponent_limit;
+   else if (a_eta < -exponent_limit)
+     a_eta = -exponent_limit;
+
+   if (c_eta > exponent_limit)
+     c_eta = exponent_limit;
+   else if (c_eta < -exponent_limit)
+     c_eta = -exponent_limit;
+
+  *dRade = (alpha_a*exp(a_eta)-alpha_c*exp(c_eta))*i_ref*pow(c_w,gamma)*s_corr;
+  *dRcde = (alpha_c*exp(c_eta)-alpha_a*exp(a_eta))*i_ref*pow(c_w,gamma)*s_corr; /* no need to recompute for  
+                                                                                 cathode particle model since 
+                                                                                 it does not need absolute accuracy */
+  }
+
+  return source;
+}
+
+real electric_contact_resistance(face_t f, Thread *t, int ns)
+{
+  real Rtr = 0.0;
+  static real last_Rtr = 0.0;
+  static Thread *last_t = NULL;
+ 
+/*==============================================*/
+  cxboolean constant_specified_in_gui = TRUE;
+/*==============================================*/
+
+  if( (THREAD_TYPE(t) != THREAD_F_JUMP) && (THREAD_TYPE(t) != THREAD_F_WALL) )
+     return Rtr;     /* do it only for jump and wall bcs */
+
+  if(constant_specified_in_gui)
+   { 
+     /* ====================================================================
+       constant resistance as specified in the GUI
+       ====================================================================*/
+
+    if (t == last_t) {
+      Rtr = last_Rtr;
+     }
+    else {
+    Rtr = get_resist_value(THREAD_ID(t));
+    last_t = t;
+    last_Rtr = Rtr;
+     }
+   }
+  else   
+   {
+    /* =====================================================================
+       variable resistance to be computeed by users 
+       NOTE: to use this feature, one has to set constant_specified_in_gui 
+             to FLASE at the begining of this function 
+       ===================================================================*/
+    /*   below is an example  */
+    /*   
+
+     int thread_id = THREAD_ID(t);
+     if ((thread_id==14) || (thread_id==15) ) 
+       {
+         Rtr = 1.0e-6;
+       }
+     else if ((thread_id==16) || (thread_id==17) )
+       {
+         Rtr = 1.0e-5;
+       }
+     else 
+       {
+         Rtr = 0.0;
+       }
+    */
+   }
+
+  return Rtr;
+}
+
+real Thermal_ctk_pemfc(face_t f, Thread *t)
+{
+/*==============================================*/
+  cxboolean constant_ctk_from_gui = TRUE;
+/*==============================================*/
+
+  real thermal_ctk=0.0;
+
+  if (THREAD_TYPE(t) == THREAD_F_JUMP)
+   {
+     thermal_ctk = THREAD_VAR(t).jump.thermal_ctk;
+
+     if(!constant_ctk_from_gui)
+      {  /* the above is the GUI input of a constant,
+            users can overwrite it with any other local values
+            for example:                                      */
+
+         thermal_ctk *= 2.0;
+      }
+
+   }
+  
+  return  thermal_ctk;
+}
+
+real Phase_Change_const(cell_t c, Thread *t)
+{
+/*==============================================*/
+   cxboolean const_rate_from_gui = TRUE;
+/*==============================================*/
+
+   real phase_ch_const=Cond_rate;       /* GUI input */
+
+   if(!const_rate_from_gui) 
+     {
+         /* the above is the GUI input of a constant,
+            users can overwrite it with any other local values
+            for example:                                      */
+
+       phase_ch_const *= 2.0;
+     }
+
+   return phase_ch_const;
+}
+
+
+
